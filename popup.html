@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>eBay Tracking Collector</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <h1>eBay Tracking Collector</h1>
+    <p class="subtitle">Sync purchase orders &amp; tracking to EveryMarket</p>
+  </header>
+
+  <section id="login-banner" class="login-banner warn">
+    <div id="login-banner-text">Click Check Login first. The result is cached; if logout is detected during collection you will be asked to check again.</div>
+    <div class="login-actions">
+      <button type="button" id="refresh-session-btn" class="secondary">Check Login</button>
+      <button type="button" id="open-login-btn" class="primary">Sign In</button>
+    </div>
+  </section>
+
+  <form id="settings-form">
+    <label>
+      Buyer email
+      <input type="email" id="email" required placeholder="buyer@example.com" autocomplete="username" />
+    </label>
+    <label>
+      Everymarket Token
+      <input type="password" id="token" required placeholder="API token" autocomplete="current-password" />
+    </label>
+    <label>
+      Lookback pages
+      <input type="number" id="days" min="1" max="50" value="3" />
+    </label>
+
+    <div class="actions">
+      <button type="button" id="save-btn" class="secondary">Save</button>
+      <button type="button" id="start-btn" class="primary" disabled>Start</button>
+      <button type="button" id="stop-btn" class="danger" disabled>Stop</button>
+    </div>
+    <p class="hint">Tip: use Collect Tracking on the eBay page. Tracking scans lookback pages only; missing orders open order detail directly.</p>
+  </form>
+
+  <section class="status-panel">
+    <div class="status-row">
+      <span class="label">Login</span>
+      <span id="login-text">Not checked</span>
+    </div>
+    <div class="status-row">
+      <span class="label">Status</span>
+      <span id="status-text">Idle</span>
+    </div>
+    <div class="status-row">
+      <span class="label">Phase</span>
+      <span id="phase-text">—</span>
+    </div>
+    <div class="status-row">
+      <span class="label">Progress</span>
+      <span id="progress-text">—</span>
+    </div>
+    <pre id="log" class="log" aria-live="polite"></pre>
+  </section>
+
+  <section class="history-panel">
+    <div class="history-header">
+      <span class="label">Recent run logs</span>
+      <div class="history-actions">
+        <button type="button" id="refresh-logs-btn" class="secondary">Refresh</button>
+        <button type="button" id="clear-logs-btn" class="danger">Clear Logs</button>
+      </div>
+    </div>
+    <div id="run-log-tabs" class="run-log-tabs"></div>
+    <pre id="history-log" class="log history-log">No run logs yet</pre>
+  </section>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
