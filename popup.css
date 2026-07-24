@@ -72,6 +72,10 @@ h1 {
   display: none;
 }
 
+.update-banner strong {
+  color: #ffe6b0;
+}
+
 .login-actions {
   display: flex;
   gap: 8px;
@@ -163,6 +167,23 @@ button:disabled {
   font-size: 11px;
   color: var(--muted);
   line-height: 1.4;
+}
+
+label.checkbox-row {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+label.checkbox-row input {
+  width: auto;
+  margin: 0;
+}
+
+.checkbox-hint {
+  margin: -4px 0 0;
 }
 
 .status-panel {

@@ -1,0 +1,14 @@
+{
+  "name": "ebay-tracking-collector",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "pack:release": "node scripts/pack-release.mjs",
+    "release": "node scripts/pack-release.mjs",
+    "publish:release": "node scripts/publish-release.mjs",
+    "publish:current": "node scripts/publish-release.mjs --current",
+    "deploy": "node scripts/deploy.mjs",
+    "deploy:dry": "node scripts/deploy.mjs --dry-run"
+  }
+}

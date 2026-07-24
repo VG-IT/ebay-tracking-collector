@@ -3,13 +3,15 @@
   "name": "eBay Tracking Collector",
   "version": "1.2.0",
   "description": "Collect eBay purchase orders and tracking numbers, then sync to fulfill.everymarket.com",
-  "permissions": ["storage", "tabs", "scripting"],
+  "permissions": ["storage", "tabs", "scripting", "alarms"],
   "host_permissions": [
     "https://*.ebay.com/*",
     "https://order.ebay.com/*",
     "https://accountsettings.ebay.com/*",
     "https://signin.ebay.com/*",
-    "https://fulfill.everymarket.com/*"
+    "https://fulfill.everymarket.com/*",
+    "https://logging.everymarket.com/*",
+    "https://api.github.com/*"
   ],
   "action": {
     "default_popup": "popup.html",

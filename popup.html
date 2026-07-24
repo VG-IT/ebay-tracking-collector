@@ -9,8 +9,16 @@
 <body>
   <header>
     <h1>eBay Tracking Collector</h1>
-    <p class="subtitle">Sync purchase orders &amp; tracking to EveryMarket</p>
+    <p class="subtitle">Sync purchase orders &amp; tracking to EveryMarket · <span id="installed-version"></span></p>
   </header>
+
+  <section id="update-banner" class="login-banner warn update-banner hidden">
+    <div id="update-banner-text"></div>
+    <div class="login-actions">
+      <button type="button" id="download-update-btn" class="primary">Download zip</button>
+      <button type="button" id="release-notes-btn" class="secondary">Release notes</button>
+    </div>
+  </section>
 
   <section id="login-banner" class="login-banner warn">
     <div id="login-banner-text">Click Check Login first. The result is cached; if logout is detected during collection you will be asked to check again.</div>
@@ -33,6 +41,11 @@
       Lookback pages
       <input type="number" id="days" min="1" max="50" value="3" />
     </label>
+    <label class="checkbox-row">
+      <input type="checkbox" id="auto-run" />
+      <span>Auto-run daily at 00:00 and 12:00</span>
+    </label>
+    <p class="hint checkbox-hint">Uses local time. Chrome must stay running; re-check login if the eBay session expires.</p>
 
     <div class="actions">
       <button type="button" id="save-btn" class="secondary">Save</button>

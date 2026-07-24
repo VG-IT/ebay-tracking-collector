@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Verify tag matches manifest version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          MANIFEST_VERSION=$(node -p "require('./manifest.json').version")
+          if [ "$TAG" != "$MANIFEST_VERSION" ]; then
+            echo "Tag v$TAG does not match manifest.json version $MANIFEST_VERSION"
+            exit 1
+          fi
+
+      - name: Pack
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zip
+          npm run release
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist-release/ebay-tracking-collector-*.zip
+            dist-release/latest.json
+          generate_release_notes: true
+          # Tag already exists when this workflow runs; upload assets / update notes.
+          fail_on_unmatched_files: true

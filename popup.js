@@ -1,6 +1,9 @@
+import { checkForUpdate, getInstalledVersion } from './lib/update.js';
+
 const emailEl = document.getElementById('email');
 const tokenEl = document.getElementById('token');
 const daysEl = document.getElementById('days');
+const autoRunEl = document.getElementById('auto-run');
 const saveBtn = document.getElementById('save-btn');
 const startBtn = document.getElementById('start-btn');
 const stopBtn = document.getElementById('stop-btn');
@@ -17,6 +20,11 @@ const progressText = document.getElementById('progress-text');
 const logEl = document.getElementById('log');
 const runLogTabsEl = document.getElementById('run-log-tabs');
 const historyLogEl = document.getElementById('history-log');
+const updateBanner = document.getElementById('update-banner');
+const updateBannerText = document.getElementById('update-banner-text');
+const downloadUpdateBtn = document.getElementById('download-update-btn');
+const releaseNotesBtn = document.getElementById('release-notes-btn');
+const installedVersionEl = document.getElementById('installed-version');
 
 let session = {
   checked: false,
@@ -25,6 +33,9 @@ let session = {
 let running = false;
 let runLogs = [];
 let selectedRunId = null;
+let updateInfo = null;
+const installedVersion = getInstalledVersion();
+installedVersionEl.textContent = `v${installedVersion}`;
 
 function appendLog(line) {
   const stamp = new Date().toLocaleTimeString();
@@ -157,13 +168,25 @@ function renderState(state = {}) {
   if (state.lastLog) appendLog(state.lastLog);
 }
 
+function renderUpdateBanner() {
+  if (!updateInfo) {
+    updateBanner.classList.add('hidden');
+    return;
+  }
+  updateBanner.classList.remove('hidden');
+  updateBannerText.innerHTML =
+    `Update available: <strong>v${updateInfo.version}</strong> (installed v${installedVersion}). ` +
+    'Download the zip, extract over your install folder, then Reload on chrome://extensions.';
+}
+
 async function loadSettings() {
   const [syncData, localData] = await Promise.all([
-    chrome.storage.sync.get({ email: '', days: 3 }),
+    chrome.storage.sync.get({ email: '', days: 3, autoRunEnabled: false }),
     chrome.storage.local.get({ token: '' }),
   ]);
   emailEl.value = syncData.email || '';
   daysEl.value = syncData.days;
+  autoRunEl.checked = syncData.autoRunEnabled === true;
   tokenEl.value = localData.token || '';
 }
 
@@ -171,6 +194,7 @@ async function saveSettings() {
   const email = emailEl.value.trim();
   const token = tokenEl.value.trim();
   const days = Number(daysEl.value) || 3;
+  const autoRunEnabled = !!autoRunEl.checked;
   if (!email) {
     appendLog('Please enter buyer email');
     return false;
@@ -180,10 +204,13 @@ async function saveSettings() {
     return false;
   }
   await Promise.all([
-    chrome.storage.sync.set({ email, days }),
+    chrome.storage.sync.set({ email, days, autoRunEnabled }),
     chrome.storage.local.set({ token }),
   ]);
-  appendLog(`Settings saved: ${email}`);
+  appendLog(
+    `Settings saved: ${email}` +
+      (autoRunEnabled ? ', auto-run at 00:00/12:00' : ''),
+  );
   updateActionButtons();
   return true;
 }
@@ -270,6 +297,18 @@ clearLogsBtn.addEventListener('click', async () => {
   appendLog('Run logs cleared');
 });
 
+downloadUpdateBtn.addEventListener('click', () => {
+  if (!updateInfo) return;
+  void chrome.tabs.create({
+    url: updateInfo.zipUrl || updateInfo.htmlUrl,
+  });
+});
+
+releaseNotesBtn.addEventListener('click', () => {
+  if (!updateInfo) return;
+  void chrome.tabs.create({ url: updateInfo.htmlUrl });
+});
+
 emailEl.addEventListener('input', updateActionButtons);
 tokenEl.addEventListener('input', updateActionButtons);
 daysEl.addEventListener('input', updateActionButtons);
@@ -304,4 +343,11 @@ chrome.runtime.onMessage.addListener((message) => {
   }
   updateActionButtons();
   await loadRunLogs();
+
+  try {
+    updateInfo = await checkForUpdate();
+    renderUpdateBanner();
+  } catch (_) {
+    /* private repo / network — ignore */
+  }
 })();
