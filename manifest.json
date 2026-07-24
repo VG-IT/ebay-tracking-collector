@@ -1,9 +1,14 @@
 {
   "manifest_version": 3,
   "name": "eBay Tracking Collector",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Collect eBay purchase orders and tracking numbers, then sync to fulfill.everymarket.com",
-  "permissions": ["storage", "tabs", "scripting", "alarms"],
+  "permissions": [
+    "storage",
+    "tabs",
+    "scripting",
+    "alarms"
+  ],
   "host_permissions": [
     "https://*.ebay.com/*",
     "https://order.ebay.com/*",
@@ -35,7 +40,10 @@
         "https://accountsettings.ebay.com/*",
         "https://signin.ebay.com/*"
       ],
-      "js": ["content/collector.js", "content/trigger-button.js"],
+      "js": [
+        "content/collector.js",
+        "content/trigger-button.js"
+      ],
       "run_at": "document_idle",
       "all_frames": false
     }
