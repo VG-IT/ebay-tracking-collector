@@ -43,16 +43,26 @@
     </label>
     <label class="checkbox-row">
       <input type="checkbox" id="auto-run" />
-      <span>Auto-run daily at 00:00 and 12:00</span>
+      <span>Auto-run full collect daily at 00:00 and 12:00</span>
     </label>
-    <p class="hint checkbox-hint">Uses local time. Chrome must stay running; re-check login if the eBay session expires.</p>
+    <p class="hint checkbox-hint">Full scrape + upload. Uses local time; Chrome must stay running.</p>
+    <label class="checkbox-row">
+      <input type="checkbox" id="pending-poll" />
+      <span>Auto-poll pending collection requests</span>
+    </label>
+    <label>
+      Pending poll interval (hours)
+      <input type="number" id="pending-poll-hours" min="1" max="24" value="2" />
+    </label>
+    <p class="hint checkbox-hint">Reads pending orders from EveryMarket, collects tracking, then uploads. Skips when queue is empty.</p>
 
     <div class="actions">
       <button type="button" id="save-btn" class="secondary">Save</button>
       <button type="button" id="start-btn" class="primary" disabled>Start</button>
+      <button type="button" id="pending-btn" class="secondary" disabled>Collect Pending</button>
       <button type="button" id="stop-btn" class="danger" disabled>Stop</button>
     </div>
-    <p class="hint">Tip: use Collect Tracking on the eBay page. Tracking scans lookback pages only; missing orders open order detail directly.</p>
+    <p class="hint">Start = full lookback + pending tracking. Collect Pending = only ops-requested / no-tracking orders, then upload.</p>
   </form>
 
   <section class="status-panel">

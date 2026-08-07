@@ -7,6 +7,7 @@ const state = {
   phase: '',
   progress: '',
   tabId: null,
+  detailTabId: null,
   openedTabIds: [],
   limitExceeded: false,
   session: {
@@ -20,6 +21,8 @@ const state = {
 const MAX_RUN_LOGS = 3;
 const AUTO_RUN_ALARM_PREFIX = 'ebay-tracking-auto-run-';
 const AUTO_RUN_HOURS = [0, 12];
+const PENDING_POLL_ALARM = 'ebay-tracking-pending-poll';
+const DEFAULT_PENDING_POLL_HOURS = 2;
 
 function nextLocalHour(hour) {
   const next = new Date();
@@ -44,6 +47,30 @@ async function syncAutoRunAlarms() {
       }
     }),
   );
+}
+
+async function syncPendingPollAlarm() {
+  const {
+    pendingPollEnabled = false,
+    pendingPollHours = DEFAULT_PENDING_POLL_HOURS,
+  } = await chrome.storage.sync.get({
+    pendingPollEnabled: false,
+    pendingPollHours: DEFAULT_PENDING_POLL_HOURS,
+  });
+
+  await chrome.alarms.clear(PENDING_POLL_ALARM);
+  if (!pendingPollEnabled) return;
+
+  const hours = Math.max(1, Number(pendingPollHours) || DEFAULT_PENDING_POLL_HOURS);
+  await chrome.alarms.create(PENDING_POLL_ALARM, {
+    delayInMinutes: 1,
+    periodInMinutes: hours * 60,
+  });
+}
+
+async function syncAllAlarms() {
+  await syncAutoRunAlarms();
+  await syncPendingPollAlarm();
 }
 
 async function persistSession() {
@@ -207,11 +234,13 @@ async function sendToTab(tabId, message, retries = 3, { ignoreStop = false } = {
   throw lastError || new Error('Failed to message content script');
 }
 
-async function openOrReuseTab(url, { ignoreStop = false } = {}) {
+async function openOrReuseTab(url, { ignoreStop = false, active = true } = {}) {
   if (!ignoreStop) ensureNotStopped();
+
   if (state.tabId != null) {
     try {
-      await chrome.tabs.update(state.tabId, { url, active: true });
+      await chrome.tabs.get(state.tabId);
+      await chrome.tabs.update(state.tabId, { url, active });
       await waitForTabComplete(state.tabId);
       trackOpenedTab(state.tabId);
       return state.tabId;
@@ -219,8 +248,63 @@ async function openOrReuseTab(url, { ignoreStop = false } = {}) {
       state.tabId = null;
     }
   }
-  const tab = await chrome.tabs.create({ url, active: true });
+
+  // Reuse a leftover purchase/order tab from a previous run if still open.
+  try {
+    const existing = await chrome.tabs.query({
+      url: ['*://*.ebay.com/*', '*://ebay.com/*', '*://order.ebay.com/*'],
+    });
+    const reusable = existing.find(
+      (tab) =>
+        tab.id != null &&
+        /\/mye\/myebay\/purchase|order\.ebay\.com\/ord\/show/i.test(tab.url || ''),
+    );
+    if (reusable?.id != null) {
+      state.tabId = reusable.id;
+      await chrome.tabs.update(state.tabId, { url, active });
+      await waitForTabComplete(state.tabId);
+      trackOpenedTab(state.tabId);
+      return state.tabId;
+    }
+  } catch (_) {
+    /* ignore */
+  }
+
+  const tab = await chrome.tabs.create({ url, active });
   state.tabId = tab.id;
+  trackOpenedTab(tab.id);
+  await waitForTabComplete(tab.id);
+  return tab.id;
+}
+
+async function closeTabQuietly(tabId) {
+  if (tabId == null) return;
+  try {
+    await chrome.tabs.remove(tabId);
+  } catch (_) {
+    /* already closed */
+  }
+  state.openedTabIds = state.openedTabIds.filter((id) => id !== tabId);
+  if (state.tabId === tabId) state.tabId = null;
+  if (state.detailTabId === tabId) state.detailTabId = null;
+}
+
+async function openOrReuseDetailTab(url) {
+  // Keep list/collector tab intact; reuse a single detail tab and keep it active.
+  if (state.detailTabId != null && state.detailTabId !== state.tabId) {
+    try {
+      await chrome.tabs.get(state.detailTabId);
+      await chrome.tabs.update(state.detailTabId, { url, active: true });
+      await waitForTabComplete(state.detailTabId);
+      trackOpenedTab(state.detailTabId);
+      return state.detailTabId;
+    } catch (_) {
+      state.detailTabId = null;
+    }
+  }
+
+  const tab = await chrome.tabs.create({ url, active: true });
+  state.detailTabId = tab.id;
   trackOpenedTab(tab.id);
   await waitForTabComplete(tab.id);
   return tab.id;
@@ -231,7 +315,11 @@ async function closeCollectorTabs() {
   if (state.tabId != null && !ids.includes(state.tabId)) {
     ids.push(state.tabId);
   }
+  if (state.detailTabId != null && !ids.includes(state.detailTabId)) {
+    ids.push(state.detailTabId);
+  }
   state.tabId = null;
+  state.detailTabId = null;
   state.openedTabIds = [];
 
   if (!ids.length) {
@@ -372,44 +460,53 @@ async function collectOrders(service, email, days, ordersUrl, maxPages = null) {
 
 async function getTrackingFromOrderPage(orderNumber) {
   const url = `https://order.ebay.com/ord/show?orderId=${encodeURIComponent(orderNumber)}#/`;
-  const detailTab = await chrome.tabs.create({ url, active: true });
-  trackOpenedTab(detailTab.id);
-  try {
-    await waitForTabComplete(detailTab.id);
-    await sleep(1500 + Math.floor(Math.random() * 1500));
-    await ensureStillLoggedIn(detailTab.id);
-    const detail = await sendToTab(detailTab.id, { action: 'scrapeOrderDetail' });
-    debug('order detail scraped', { orderNumber, detail });
-    if (detail?.limitExceeded) {
-      state.limitExceeded = true;
-      log('Order detail daily limit exceeded');
-      return null;
-    }
-    if (!detail?.tracking) return null;
+  // Reuse one background detail tab for the whole run (never open one tab per order).
+  const detailTabId = await openOrReuseDetailTab(url);
+  // Content script waits for SPA elements; short settle only (avoid racing tab complete).
+  await sleep(800 + Math.floor(Math.random() * 700));
+  await ensureStillLoggedIn(detailTabId);
 
-    const payload = {
-      order_number: orderNumber,
-      tracking: detail.tracking,
-    };
-    if (detail.carrier) payload.carrier = detail.carrier;
-    if (detail.address) payload.address = detail.address;
-    if (detail.credit_card_last_digits) {
-      payload.credit_card_last_digits = detail.credit_card_last_digits;
-    }
-    if (detail.delivered_date) payload.delivered_date = detail.delivered_date;
-    if (detail.purchase_date) payload.purchase_date = detail.purchase_date;
-    debug('order detail tracking payload', payload);
-    return payload;
-  } finally {
-    // Keep tab tracked; all opened tabs are closed together after the run.
-    if (state.tabId != null) {
-      try {
-        await chrome.tabs.update(state.tabId, { active: true });
-      } catch (_) {
-        /* ignore */
-      }
-    }
+  let detail = await sendToTab(detailTabId, { action: 'scrapeOrderDetail' });
+  debug('order detail scraped', { orderNumber, detail });
+
+  // One retry if page shell loaded but tracking not extracted yet.
+  if (detail?.ok !== false && !detail?.limitExceeded && !detail?.tracking && detail?.ready) {
+    log(`Retry scrape order detail: ${orderNumber}`);
+    await sleep(1500);
+    detail = await sendToTab(detailTabId, { action: 'scrapeOrderDetail' });
+    debug('order detail scraped (retry)', { orderNumber, detail });
   }
+
+  if (detail?.ok === false) {
+    log(`Order detail scrape error: ${orderNumber}: ${detail.error || 'unknown'}`);
+    return null;
+  }
+  if (detail?.limitExceeded) {
+    state.limitExceeded = true;
+    log('Order detail daily limit exceeded');
+    return null;
+  }
+  if (!detail?.tracking) {
+    log(
+      `No tracking extracted: ${orderNumber}` +
+        ` (ready=${!!detail?.ready}, hasTrackingUi=${!!detail?.hasTrackingUi})`
+    );
+    return null;
+  }
+
+  const payload = {
+    order_number: orderNumber,
+    tracking: detail.tracking,
+  };
+  if (detail.carrier) payload.carrier = detail.carrier;
+  if (detail.address) payload.address = detail.address;
+  if (detail.credit_card_last_digits) {
+    payload.credit_card_last_digits = detail.credit_card_last_digits;
+  }
+  if (detail.delivered_date) payload.delivered_date = detail.delivered_date;
+  if (detail.purchase_date) payload.purchase_date = detail.purchase_date;
+  debug('order detail tracking payload', payload);
+  return payload;
 }
 
 async function collectOrderTrackings(service, email, lookbackPages) {
@@ -537,8 +634,6 @@ async function collectOrderTrackings(service, email, lookbackPages) {
     const detailTracking = await getTrackingFromOrderPage(orderNumber);
     if (detailTracking) {
       await reportTrackingBatch([detailTracking], `order-detail-${orderNumber}`);
-    } else {
-      log(`No tracking on order detail: ${orderNumber}`);
     }
     await sleep(1000);
   }
@@ -575,7 +670,7 @@ async function collectOrderTrackings(service, email, lookbackPages) {
   log('================================================');
 }
 
-async function runCollector({ email, days } = {}) {
+async function runCollector({ email, days, mode = 'full' } = {}) {
   if (state.running) return { error: 'Already running' };
 
   await loadCachedSession();
@@ -585,6 +680,7 @@ async function runCollector({ email, days } = {}) {
   const buyerEmail = (email || settings.email || '').trim();
   const apiToken = (localSettings.token || '').trim();
   const lookbackPages = Number(days || settings.days) || 3;
+  const pendingOnly = mode === 'pending';
 
   if (!buyerEmail) {
     return { error: 'Please save a buyer email in extension settings first' };
@@ -600,24 +696,40 @@ async function runCollector({ email, days } = {}) {
   state.stopRequested = false;
   state.limitExceeded = false;
   state.openedTabIds = [];
+  state.detailTabId = null;
   setPhase('Starting');
   startRunLog({ email: buyerEmail, days: lookbackPages });
 
   try {
-    log(`Collector started for ${buyerEmail}, lookbackPages=${lookbackPages}`);
     const service = new EbayOrderService(apiToken);
 
-    // Order list still uses lookback as days cutoff for purchase history
-    await collectOrders(service, buyerEmail, lookbackPages, ORDER_URLS.all);
-    await collectOrders(service, buyerEmail, lookbackPages, ORDER_URLS.payment_failed, 3);
-    await collectOrders(service, buyerEmail, lookbackPages, ORDER_URLS.returns_and_canceled, 3);
-    await collectOrderTrackings(service, buyerEmail, lookbackPages);
+    if (pendingOnly) {
+      setPhase('Loading pending orders');
+      const pending = await service.getOrders(buyerEmail);
+      const pendingCount = Array.isArray(pending) ? pending.length : 0;
+      log(`Pending tracking / collection orders: ${pendingCount}`);
+      if (!pendingCount) {
+        setPhase('Done', 'no pending');
+        log('No pending orders; skip scrape');
+        await finishRunLog('completed', { ok: true, pendingOnly: true, empty: true });
+        return { ok: true, email: buyerEmail, empty: true };
+      }
+      log(`Collector started for ${buyerEmail}, mode=pending`);
+      await collectOrderTrackings(service, buyerEmail, lookbackPages);
+    } else {
+      log(`Collector started for ${buyerEmail}, lookbackPages=${lookbackPages}`);
+      // Order list still uses lookback as days cutoff for purchase history
+      await collectOrders(service, buyerEmail, lookbackPages, ORDER_URLS.all);
+      await collectOrders(service, buyerEmail, lookbackPages, ORDER_URLS.payment_failed, 3);
+      await collectOrders(service, buyerEmail, lookbackPages, ORDER_URLS.returns_and_canceled, 3);
+      await collectOrderTrackings(service, buyerEmail, lookbackPages);
+    }
 
     await service.sendClickLog(buyerEmail);
 
     setPhase('Done', 'completed');
     log('Collector finished');
-    await finishRunLog('completed', { ok: true });
+    await finishRunLog('completed', { ok: true, pendingOnly });
     return { ok: true, email: buyerEmail };
   } catch (err) {
     if (String(err.message) === 'LOGGED_OUT') {
@@ -649,7 +761,15 @@ async function runCollector({ email, days } = {}) {
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === 'START') {
-    runCollector(message.payload || {}).then((result) => sendResponse(result || { ok: true }));
+    runCollector({ ...(message.payload || {}), mode: 'full' }).then((result) =>
+      sendResponse(result || { ok: true }),
+    );
+    return true;
+  }
+  if (message?.type === 'START_PENDING') {
+    runCollector({ ...(message.payload || {}), mode: 'pending' }).then((result) =>
+      sendResponse(result || { ok: true }),
+    );
     return true;
   }
   if (message?.type === 'STOP') {
@@ -691,6 +811,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === PENDING_POLL_ALARM) {
+    void (async () => {
+      const { pendingPollEnabled = false } = await chrome.storage.sync.get({
+        pendingPollEnabled: false,
+      });
+      if (!pendingPollEnabled) return;
+      log('Scheduled pending-poll alarm fired');
+      await runCollector({ mode: 'pending' });
+    })();
+    return;
+  }
+
   if (!alarm.name.startsWith(AUTO_RUN_ALARM_PREFIX)) return;
 
   void (async () => {
@@ -702,23 +834,24 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
     // One-shot alarms are recreated so they stay at local 00:00/12:00 across DST.
     await chrome.alarms.create(alarm.name, { when: nextLocalHour(hour) });
-    await runCollector();
+    log('Scheduled full auto-run alarm fired');
+    await runCollector({ mode: 'full' });
   })();
 });
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName === 'sync' && changes.autoRunEnabled) {
-    void syncAutoRunAlarms();
-  }
+  if (areaName !== 'sync') return;
+  if (changes.autoRunEnabled) void syncAutoRunAlarms();
+  if (changes.pendingPollEnabled || changes.pendingPollHours) void syncPendingPollAlarm();
 });
 
 chrome.runtime.onInstalled.addListener(() => {
-  void syncAutoRunAlarms();
+  void syncAllAlarms();
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  void syncAutoRunAlarms();
+  void syncAllAlarms();
 });
 
 void loadCachedSession();
-void syncAutoRunAlarms();
+void syncAllAlarms();

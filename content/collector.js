@@ -164,7 +164,98 @@
     return (node.textContent || node.nodeValue || '').trim();
   }
 
-  function scrapeOrderDetail() {
+  function extractTrackingFromOrderDetail() {
+    const candidates = [];
+
+    // Prefer the classic order-detail tracking box; avoid generic "Order number" labels.
+    const xpathCandidates = [
+      "//div[contains(@class,'inner-tracking-box')]//span[normalize-space()='Number']/ancestor::dt[1]/following-sibling::dd[1]",
+      "//div[contains(@class,'inner-tracking-box')]//span[contains(normalize-space(.),'Number')]/ancestor::dt[1]/following-sibling::dd[1]",
+      "//div[contains(@class,'inner-tracking-box')]//dd",
+      "//span[normalize-space()='Tracking number']/ancestor::dt[1]/following-sibling::dd[1]",
+      "//span[contains(normalize-space(.),'Tracking number')]/ancestor::*[self::dt or self::div][1]/following-sibling::*[1]",
+      "//*[contains(@class,'tracking') and not(contains(@class,'order'))]//a[contains(translate(@href,'TRACK','track'),'track')]",
+    ];
+    for (const xp of xpathCandidates) {
+      const node = xpathFirst(xp);
+      const value = text(node);
+      if (value) candidates.push(value);
+    }
+
+    const cssSelectors = [
+      '.inner-tracking-box dd',
+      '.inner-tracking-box a',
+      '[class*="tracking-number"]',
+      '[class*="trackingNumber"]',
+      '[data-test-id*="tracking"]',
+      'a[href*="track"]',
+    ];
+    for (const selector of cssSelectors) {
+      for (const el of Array.from(document.querySelectorAll(selector))) {
+        const value = text(el);
+        if (value) candidates.push(value);
+      }
+    }
+
+    const bodyText = document.body?.innerText || '';
+    const nearLabel = bodyText.match(
+      /tracking(?:\s*number)?\s*[:#]?\s*([A-Z0-9][A-Z0-9\-]{5,34})/i
+    );
+    if (nearLabel?.[1]) candidates.push(nearLabel[1]);
+
+    for (const raw of candidates) {
+      const cleaned = String(raw)
+        .replace(/^number\s*:?\s*/i, '')
+        .replace(/^tracking(?:\s*number)?\s*:?\s*/i, '')
+        .trim();
+      if (!cleaned) continue;
+      if (/^(carrier|number|tracking|status|see|view|details|track package|track order)$/i.test(cleaned)) {
+        continue;
+      }
+      if (/^[A-Z0-9][A-Z0-9\-]{5,34}$/i.test(cleaned)) return cleaned;
+      const embedded = cleaned.match(
+        /\b(1Z[A-Z0-9]{16}|[A-Z]{2}\d{9}[A-Z]{2}|\d{12,22}|[A-Z0-9]{10,34})\b/i
+      );
+      if (embedded?.[1]) return embedded[1];
+    }
+    return null;
+  }
+
+  function extractCarrierFromOrderDetail() {
+    const xpathCandidates = [
+      "//div[contains(@class,'inner-tracking-box')]//span[normalize-space()='Carrier']/ancestor::dt[1]/following-sibling::dd[1]",
+      "//span[normalize-space()='Carrier']/ancestor::dt[1]/following-sibling::dd[1]",
+      "//span[contains(normalize-space(.),'Carrier')]/ancestor::dt[1]/following-sibling::dd[1]",
+    ];
+    for (const xp of xpathCandidates) {
+      const value = text(xpathFirst(xp));
+      if (value && !/^carrier$/i.test(value)) return value.replace(/:$/, '').trim();
+    }
+    return null;
+  }
+
+  async function waitForOrderDetailReady(timeout = 15000) {
+    const started = Date.now();
+    while (Date.now() - started < timeout) {
+      if (checkLimitExceeded()) return { ready: false, limitExceeded: true };
+
+      const hasTrackingUi =
+        !!document.querySelector('.inner-tracking-box, [class*="tracking-number"], [class*="trackingNumber"]') ||
+        /tracking\s*(number)?/i.test(document.body?.innerText || '');
+      const hasOrderShell =
+        !!document.querySelector('.order-box, .delivery-stepper, [class*="order-info"]') ||
+        /order\s*(number|#)/i.test(document.body?.innerText || '');
+
+      if (hasTrackingUi || hasOrderShell) {
+        await sleep(600);
+        return { ready: true, limitExceeded: false, hasTrackingUi };
+      }
+      await sleep(250);
+    }
+    return { ready: false, limitExceeded: false, hasTrackingUi: false };
+  }
+
+  async function scrapeOrderDetail({ readyTimeout = 15000, trackingTimeout = 15000 } = {}) {
     if (checkLimitExceeded()) {
       console.warn('[eBay Tracking Collector] scrapeOrderDetail limit exceeded', {
         href: location.href,
@@ -172,15 +263,21 @@
       return { limitExceeded: true };
     }
 
-    const trackingDd = xpathFirst(
-      "//div[@class='inner-tracking-box']//span[text()='Number']/ancestor::dt[1]/following-sibling::dd[1]"
-    );
-    const tracking = text(trackingDd) || null;
+    const startedAt = Date.now();
+    const ready = await waitForOrderDetailReady(readyTimeout);
+    if (ready.limitExceeded) return { limitExceeded: true };
 
-    const carrierDd = xpathFirst(
-      "//span[text()='Carrier']/ancestor::dt[1]/following-sibling::dd[1]"
-    );
-    const carrier = text(carrierDd) || null;
+    let tracking = extractTrackingFromOrderDetail();
+    let carrier = extractCarrierFromOrderDetail();
+
+    // Tab "complete" often fires before SPA hydrates tracking; keep polling.
+    const pollStarted = Date.now();
+    while (!tracking && Date.now() - pollStarted < trackingTimeout) {
+      await sleep(400);
+      if (checkLimitExceeded()) return { limitExceeded: true };
+      tracking = extractTrackingFromOrderDetail();
+      if (!carrier) carrier = extractCarrierFromOrderDetail();
+    }
 
     const addressNodes = document.evaluate(
       "//div[contains(@class, 'delivery-address-text')]//text()",
@@ -198,7 +295,10 @@
 
     let creditCardLastDigits = null;
     const cc = xpathText("//div[contains(@class, 'payment-instrument-description')]//span[@class='clipped']");
-    if (cc) creditCardLastDigits = cc.split(' ').pop();
+    if (cc && !/@/.test(cc)) {
+      const digits = cc.match(/(\d{3,4})\s*$/);
+      if (digits) creditCardLastDigits = digits[1];
+    }
 
     let deliveredDate = null;
     const lastStep = xpathFirst("//div[@class='delivery-stepper']//div[@class='progress-stepper__items']/div[last()]");
@@ -217,6 +317,8 @@
 
     const detail = {
       limitExceeded: false,
+      ready: ready.ready,
+      hasTrackingUi: !!ready.hasTrackingUi,
       tracking: tracking || null,
       carrier: carrier || null,
       address,
@@ -227,6 +329,7 @@
     console.log('[eBay Tracking Collector] scrapeOrderDetail', {
       href: location.href,
       detail,
+      elapsedMs: Date.now() - startedAt,
     });
     return detail;
   }
@@ -572,7 +675,7 @@
             break;
           case 'scrapeOrderDetail':
             await waitForBody();
-            sendResponse({ ok: true, ...(scrapeOrderDetail()) });
+            sendResponse({ ok: true, ...(await scrapeOrderDetail()) });
             break;
           case 'checkLimitExceeded':
             sendResponse({ ok: true, limitExceeded: checkLimitExceeded() });

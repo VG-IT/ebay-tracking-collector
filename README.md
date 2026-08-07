@@ -13,21 +13,25 @@ Browser extension port of `web_crawler/bin/ebay/tracking_collector.py`. Scrapes 
 2. Click **Check Login** to open the Purchase URL in the background:
    - Login page → prompt to sign in
    - Otherwise → treated as logged in (result is cached)
-3. On any eBay page, click the bottom-right **Collect Tracking** button to start (or use **Start** in the popup)
-4. If logout is detected while collecting, run **Check Login** again
-5. Opened collector tabs are closed when the run finishes
+3. On any eBay page, click the bottom-right **Collect Tracking** button to start a **full** collect (or use **Start** in the popup)
+4. Use **Collect Pending** in the popup to only fetch ops-requested / no-tracking orders and upload them
+5. If logout is detected while collecting, run **Check Login** again
+6. Opened collector tabs are closed when the run finishes
 
 ### Scheduled collection
 
-After saving a valid login and settings, enable **Auto-run daily at 00:00 and
-12:00** in the popup. The schedule uses the computer's local time. Chrome must
-be running; if the eBay session expires, check login again.
+After saving a valid login and settings:
+
+- **Auto-run full collect daily at 00:00 and 12:00** — full scrape + upload
+- **Auto-poll pending collection requests** — every N hours (default 2), reads pending from EveryMarket, collects only those, uploads; skips when empty
+
+Schedules use the computer's local time. Chrome must be running; if the eBay session expires, check login again.
 
 ## Notes
 
 - Buyer email is stored in `chrome.storage.sync`
 - Everymarket token is stored in `chrome.storage.local` and shown as a password field
-- Tracking scans only lookback pages; remaining orders open order detail URLs directly
+- Tracking scans only lookback pages; remaining orders reuse **one** order-detail tab (updated in place), closed when the run finishes
 - Successful syncs report to EveryMarket logging; completed runs also post a plugin click log
 
 ## Release (GitHub Release zip)

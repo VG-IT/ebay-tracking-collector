@@ -4,8 +4,11 @@ const emailEl = document.getElementById('email');
 const tokenEl = document.getElementById('token');
 const daysEl = document.getElementById('days');
 const autoRunEl = document.getElementById('auto-run');
+const pendingPollEl = document.getElementById('pending-poll');
+const pendingPollHoursEl = document.getElementById('pending-poll-hours');
 const saveBtn = document.getElementById('save-btn');
 const startBtn = document.getElementById('start-btn');
+const pendingBtn = document.getElementById('pending-btn');
 const stopBtn = document.getElementById('stop-btn');
 const refreshSessionBtn = document.getElementById('refresh-session-btn');
 const openLoginBtn = document.getElementById('open-login-btn');
@@ -154,8 +157,10 @@ function updateActionButtons() {
     !!tokenEl.value.trim() &&
     !running;
   startBtn.disabled = !canStart;
+  pendingBtn.disabled = !canStart;
   stopBtn.disabled = !running;
   saveBtn.disabled = running;
+  pendingPollHoursEl.disabled = !pendingPollEl.checked;
 }
 
 function renderState(state = {}) {
@@ -181,12 +186,20 @@ function renderUpdateBanner() {
 
 async function loadSettings() {
   const [syncData, localData] = await Promise.all([
-    chrome.storage.sync.get({ email: '', days: 3, autoRunEnabled: false }),
+    chrome.storage.sync.get({
+      email: '',
+      days: 3,
+      autoRunEnabled: false,
+      pendingPollEnabled: false,
+      pendingPollHours: 2,
+    }),
     chrome.storage.local.get({ token: '' }),
   ]);
   emailEl.value = syncData.email || '';
   daysEl.value = syncData.days;
   autoRunEl.checked = syncData.autoRunEnabled === true;
+  pendingPollEl.checked = syncData.pendingPollEnabled === true;
+  pendingPollHoursEl.value = Math.max(1, Number(syncData.pendingPollHours) || 2);
   tokenEl.value = localData.token || '';
 }
 
@@ -195,6 +208,8 @@ async function saveSettings() {
   const token = tokenEl.value.trim();
   const days = Number(daysEl.value) || 3;
   const autoRunEnabled = !!autoRunEl.checked;
+  const pendingPollEnabled = !!pendingPollEl.checked;
+  const pendingPollHours = Math.max(1, Number(pendingPollHoursEl.value) || 2);
   if (!email) {
     appendLog('Please enter buyer email');
     return false;
@@ -204,12 +219,19 @@ async function saveSettings() {
     return false;
   }
   await Promise.all([
-    chrome.storage.sync.set({ email, days, autoRunEnabled }),
+    chrome.storage.sync.set({
+      email,
+      days,
+      autoRunEnabled,
+      pendingPollEnabled,
+      pendingPollHours,
+    }),
     chrome.storage.local.set({ token }),
   ]);
   appendLog(
     `Settings saved: ${email}` +
-      (autoRunEnabled ? ', auto-run at 00:00/12:00' : ''),
+      (autoRunEnabled ? ', auto-run at 00:00/12:00' : '') +
+      (pendingPollEnabled ? `, pending-poll every ${pendingPollHours}h` : ''),
   );
   updateActionButtons();
   return true;
@@ -255,7 +277,7 @@ startBtn.addEventListener('click', async () => {
   const email = emailEl.value.trim();
   const days = Number(daysEl.value) || 3;
   logEl.textContent = '';
-  appendLog('Starting collector…');
+  appendLog('Starting full collector…');
   running = true;
   updateActionButtons();
   const response = await chrome.runtime.sendMessage({
@@ -263,6 +285,29 @@ startBtn.addEventListener('click', async () => {
     payload: { email, days },
   });
   if (response?.error) appendLog(`Error: ${response.error}`);
+  await loadRunLogs();
+});
+
+pendingBtn.addEventListener('click', async () => {
+  const saved = await saveSettings();
+  if (!saved) return;
+  if (!session.loggedIn) {
+    appendLog('Please Check Login first');
+    return;
+  }
+
+  const email = emailEl.value.trim();
+  const days = Number(daysEl.value) || 3;
+  logEl.textContent = '';
+  appendLog('Starting pending-only collector…');
+  running = true;
+  updateActionButtons();
+  const response = await chrome.runtime.sendMessage({
+    type: 'START_PENDING',
+    payload: { email, days },
+  });
+  if (response?.error) appendLog(`Error: ${response.error}`);
+  else if (response?.empty) appendLog('No pending orders to collect');
   await loadRunLogs();
 });
 
@@ -312,6 +357,7 @@ releaseNotesBtn.addEventListener('click', () => {
 emailEl.addEventListener('input', updateActionButtons);
 tokenEl.addEventListener('input', updateActionButtons);
 daysEl.addEventListener('input', updateActionButtons);
+pendingPollEl.addEventListener('change', updateActionButtons);
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === 'STATE') {
