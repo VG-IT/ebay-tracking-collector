@@ -1,4 +1,5 @@
 import { checkForUpdate, getInstalledVersion } from './lib/update.js';
+import { normalizeAccount } from './lib/api.js';
 
 const emailEl = document.getElementById('email');
 const tokenEl = document.getElementById('token');
@@ -204,7 +205,7 @@ async function loadSettings() {
 }
 
 async function saveSettings() {
-  const email = emailEl.value.trim();
+  const email = normalizeAccount(emailEl.value);
   const token = tokenEl.value.trim();
   const days = Number(daysEl.value) || 3;
   const autoRunEnabled = !!autoRunEl.checked;
@@ -218,6 +219,7 @@ async function saveSettings() {
     appendLog('Please enter Everymarket Token');
     return false;
   }
+  emailEl.value = email;
   await Promise.all([
     chrome.storage.sync.set({
       email,
@@ -274,7 +276,7 @@ startBtn.addEventListener('click', async () => {
     return;
   }
 
-  const email = emailEl.value.trim();
+  const email = normalizeAccount(emailEl.value);
   const days = Number(daysEl.value) || 3;
   logEl.textContent = '';
   appendLog('Starting full collector…');
@@ -296,7 +298,7 @@ pendingBtn.addEventListener('click', async () => {
     return;
   }
 
-  const email = emailEl.value.trim();
+  const email = normalizeAccount(emailEl.value);
   const days = Number(daysEl.value) || 3;
   logEl.textContent = '';
   appendLog('Starting pending-only collector…');
@@ -307,7 +309,7 @@ pendingBtn.addEventListener('click', async () => {
     payload: { email, days },
   });
   if (response?.error) appendLog(`Error: ${response.error}`);
-  else if (response?.empty) appendLog('No pending orders to collect');
+  else if (response?.empty) appendLog('Lookback list status collected; no pending detail requests');
   await loadRunLogs();
 });
 

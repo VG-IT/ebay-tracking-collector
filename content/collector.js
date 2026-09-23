@@ -255,6 +255,31 @@
     return { ready: false, limitExceeded: false, hasTrackingUi: false };
   }
 
+  function extractStatusFromOrderDetail() {
+    const lastStep = xpathFirst(
+      "//div[@class='delivery-stepper']//div[@class='progress-stepper__items']/div[last()]",
+    );
+    if (lastStep) {
+      const msg = text(
+        lastStep.querySelector('.progress-stepper__text h4 .textual-display, .progress-stepper__text h4'),
+      );
+      if (msg) return msg;
+    }
+
+    const primary = text(
+      document.querySelector(
+        'span[class*="primaryMessage"], [class*="order-status"], .section-notice__main',
+      ),
+    );
+    if (primary) return primary;
+
+    const body = document.body?.innerText || '';
+    const match = body.match(
+      /\b(Delivered|Tracking available|Awaiting shipment|Shipped to you|Out for delivery|Refunded|Cancelled|Canceled|Return requested|Delivery attempted)\b/i,
+    );
+    return match ? match[1] : null;
+  }
+
   async function scrapeOrderDetail({ readyTimeout = 15000, trackingTimeout = 15000 } = {}) {
     if (checkLimitExceeded()) {
       console.warn('[eBay Tracking Collector] scrapeOrderDetail limit exceeded', {
@@ -319,6 +344,7 @@
       limitExceeded: false,
       ready: ready.ready,
       hasTrackingUi: !!ready.hasTrackingUi,
+      status: extractStatusFromOrderDetail(),
       tracking: tracking || null,
       carrier: carrier || null,
       address,

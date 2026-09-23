@@ -1,4 +1,4 @@
-import { EbayOrderService } from './lib/api.js';
+import { EbayOrderService, normalizeAccount } from './lib/api.js';
 import { LOGIN_CHECK_URL, ORDER_URLS } from './lib/config.js';
 
 const state = {
@@ -289,22 +289,8 @@ async function closeTabQuietly(tabId) {
   if (state.detailTabId === tabId) state.detailTabId = null;
 }
 
-async function openOrReuseDetailTab(url) {
-  // Keep list/collector tab intact; reuse a single detail tab and keep it active.
-  if (state.detailTabId != null && state.detailTabId !== state.tabId) {
-    try {
-      await chrome.tabs.get(state.detailTabId);
-      await chrome.tabs.update(state.detailTabId, { url, active: true });
-      await waitForTabComplete(state.detailTabId);
-      trackOpenedTab(state.detailTabId);
-      return state.detailTabId;
-    } catch (_) {
-      state.detailTabId = null;
-    }
-  }
-
+async function openFreshDetailTab(url) {
   const tab = await chrome.tabs.create({ url, active: true });
-  state.detailTabId = tab.id;
   trackOpenedTab(tab.id);
   await waitForTabComplete(tab.id);
   return tab.id;
@@ -426,6 +412,9 @@ async function collectOrders(service, email, days, ordersUrl, maxPages = null) {
       break;
     }
 
+    orders.forEach((order) => {
+      order.buyer_email = email;
+    });
     log(`Found ${orders.length} orders on page ${page}`);
     try {
       const resp = await service.saveOrders(orders);
@@ -458,97 +447,89 @@ async function collectOrders(service, email, days, ordersUrl, maxPages = null) {
   }
 }
 
-async function getTrackingFromOrderPage(orderNumber) {
+async function getOrderDetail(orderNumber) {
   const url = `https://order.ebay.com/ord/show?orderId=${encodeURIComponent(orderNumber)}#/`;
-  // Reuse one background detail tab for the whole run (never open one tab per order).
-  const detailTabId = await openOrReuseDetailTab(url);
-  // Content script waits for SPA elements; short settle only (avoid racing tab complete).
+  const detailTabId = await openFreshDetailTab(url);
   await sleep(800 + Math.floor(Math.random() * 700));
-  await ensureStillLoggedIn(detailTabId);
 
-  let detail = await sendToTab(detailTabId, { action: 'scrapeOrderDetail' });
-  debug('order detail scraped', { orderNumber, detail });
+  try {
+    await ensureStillLoggedIn(detailTabId);
 
-  // One retry if page shell loaded but tracking not extracted yet.
-  if (detail?.ok !== false && !detail?.limitExceeded && !detail?.tracking && detail?.ready) {
-    log(`Retry scrape order detail: ${orderNumber}`);
-    await sleep(1500);
-    detail = await sendToTab(detailTabId, { action: 'scrapeOrderDetail' });
-    debug('order detail scraped (retry)', { orderNumber, detail });
-  }
+    let detail = await sendToTab(detailTabId, { action: 'scrapeOrderDetail' });
+    debug('order detail scraped', { orderNumber, detail });
 
-  if (detail?.ok === false) {
-    log(`Order detail scrape error: ${orderNumber}: ${detail.error || 'unknown'}`);
-    return null;
-  }
-  if (detail?.limitExceeded) {
-    state.limitExceeded = true;
-    log('Order detail daily limit exceeded');
-    return null;
-  }
-  if (!detail?.tracking) {
-    log(
-      `No tracking extracted: ${orderNumber}` +
-        ` (ready=${!!detail?.ready}, hasTrackingUi=${!!detail?.hasTrackingUi})`
-    );
-    return null;
-  }
+    if (detail?.ok !== false && !detail?.limitExceeded && !detail?.tracking && detail?.ready) {
+      log(`Retry scrape order detail: ${orderNumber}`);
+      await sleep(1500);
+      detail = await sendToTab(detailTabId, { action: 'scrapeOrderDetail' });
+      debug('order detail scraped (retry)', { orderNumber, detail });
+    }
 
-  const payload = {
-    order_number: orderNumber,
-    tracking: detail.tracking,
-  };
-  if (detail.carrier) payload.carrier = detail.carrier;
-  if (detail.address) payload.address = detail.address;
-  if (detail.credit_card_last_digits) {
-    payload.credit_card_last_digits = detail.credit_card_last_digits;
+    if (detail?.ok === false) {
+      log(`Order detail scrape error: ${orderNumber}: ${detail.error || 'unknown'}`);
+      return null;
+    }
+    if (detail?.limitExceeded) {
+      state.limitExceeded = true;
+      log('Order detail daily limit exceeded');
+      return null;
+    }
+
+    const payload = { order_number: orderNumber };
+    if (detail?.status) payload.status = detail.status;
+    if (detail?.tracking) payload.tracking = detail.tracking;
+    if (detail?.carrier) payload.carrier = detail.carrier;
+    if (detail?.address) payload.address = detail.address;
+    if (detail?.credit_card_last_digits) {
+      payload.credit_card_last_digits = detail.credit_card_last_digits;
+    }
+    if (detail?.delivered_date) payload.delivered_date = detail.delivered_date;
+    if (detail?.purchase_date) payload.purchase_date = detail.purchase_date;
+
+    if (!payload.tracking && !payload.status) {
+      log(
+        `No status/tracking extracted: ${orderNumber}` +
+          ` (ready=${!!detail?.ready}, hasTrackingUi=${!!detail?.hasTrackingUi})`,
+      );
+    }
+    return payload;
+  } finally {
+    await closeTabQuietly(detailTabId);
   }
-  if (detail.delivered_date) payload.delivered_date = detail.delivered_date;
-  if (detail.purchase_date) payload.purchase_date = detail.purchase_date;
-  debug('order detail tracking payload', payload);
-  return payload;
 }
 
-async function collectOrderTrackings(service, email, lookbackPages) {
+async function collectLookbackOrderStatuses(service, email, lookbackPages) {
+  log(`Collecting lookback order-list status for ${email}`);
+  await collectOrders(service, email, lookbackPages, ORDER_URLS.all);
+  await collectOrders(service, email, lookbackPages, ORDER_URLS.payment_failed, 3);
+  await collectOrders(service, email, lookbackPages, ORDER_URLS.returns_and_canceled, 3);
+}
+
+async function collectTrackingsFromShippedLookback(service, email, lookbackPages) {
   const maxPages = Math.max(1, Number(lookbackPages) || 3);
-  setPhase('Loading no-tracking orders');
-  let noTrackingOrders = await service.getOrders(email);
-  debug('no-tracking orders from API', noTrackingOrders);
-  if (!noTrackingOrders?.length) {
-    log('Pending tracking orders: 0');
-    log('No orders missing tracking');
-    return;
-  }
+  setPhase('Collecting shipped-list tracking', `up to ${maxPages} page(s)`);
+  log(`Shipped lookback tracking: scan ${maxPages} page(s), query em-data, collect missing tracking`);
 
-  const pendingTotal = noTrackingOrders.length;
-  const pendingNumbers = noTrackingOrders
-    .map((order) => order.order_number)
-    .filter(Boolean);
-  log(`Pending tracking orders: ${pendingTotal}`);
-  log(`Pending order numbers: ${pendingNumbers.join(', ')}`);
-  log(`Scan at most ${maxPages} lookback page(s); open order detail for the rest`);
+  const tabId = await openOrReuseTab(ORDER_URLS.shipped);
+  await sleep(2000);
+  await ensureStillLoggedIn(tabId);
 
-  const byNumber = new Map(
-    noTrackingOrders.map((order) => [order.order_number, order])
-  );
-  const collected = [];
   const reportSuccess = [];
   const reportFailed = [];
+  const collected = [];
 
   async function reportTrackingBatch(batch, source) {
     if (!batch.length) return;
-    for (const item of batch) {
+    const withBuyer = batch.map((item) => ({ ...item, buyer_email: email }));
+    for (const item of withBuyer) {
       collected.push(item);
-      byNumber.delete(item.order_number);
       log(
         `Collected tracking[${source}]: order=${item.order_number}, tracking=${item.tracking}` +
-          (item.carrier ? `, carrier=${item.carrier}` : '')
+          (item.carrier ? `, carrier=${item.carrier}` : ''),
       );
     }
-    debug('saving tracking batch', { source, batch });
     try {
-      const resp = await service.saveOrders(batch);
-      debug('save trackings response', resp);
+      const resp = await service.saveOrders(withBuyer);
       reportSuccess.push(...batch.map((item) => item.order_number));
       log(`Tracking report succeeded[${source}]: ${batch.length} item(s)`);
       log(`Report response: ${JSON.stringify(resp)}`);
@@ -556,57 +537,68 @@ async function collectOrderTrackings(service, email, lookbackPages) {
       console.error('[eBay Tracking Collector] save trackings failed', err);
       reportFailed.push(...batch.map((item) => item.order_number));
       log(`Tracking report failed[${source}]: ${err.message}`);
-      log(`Failed order numbers: ${batch.map((item) => item.order_number).join(', ')}`);
     }
   }
-
-  async function collectFromPageResult(result, source) {
-    const batch = [];
-    for (const tracking of result.trackings || []) {
-      if (!byNumber.has(tracking.order_number)) continue;
-      batch.push(tracking);
-    }
-
-    for (const orderNumber of result.needsOrderPage || []) {
-      if (!byNumber.has(orderNumber)) continue;
-      if (state.limitExceeded) continue;
-      log(`Opening order detail for ${orderNumber}`);
-      const detailTracking = await getTrackingFromOrderPage(orderNumber);
-      if (detailTracking) batch.push(detailTracking);
-    }
-
-    await reportTrackingBatch(batch, source);
-  }
-
-  const tabId = await openOrReuseTab(ORDER_URLS.shipped);
-  await sleep(2000);
-  await ensureStillLoggedIn(tabId);
 
   let page = 1;
-  while (byNumber.size > 0 && page <= maxPages) {
+  while (page <= maxPages) {
     ensureNotStopped();
-    setPhase('Collecting trackings', `page ${page}/${maxPages}, remaining ${byNumber.size}`);
+    setPhase('Collecting shipped-list tracking', `page ${page}/${maxPages}`);
     await ensureStillLoggedIn(tabId);
 
-    const orderNumbers = Array.from(byNumber.keys());
-    const result = await sendToTab(tabId, {
-      action: 'scrapeTrackings',
-      orderNumbers,
+    const { orders } = await sendToTab(tabId, {
+      action: 'scrapeOrders',
+      buyerEmail: email,
     });
-    debug('collectTrackings page result', { page, result });
-    log(`Finished page ${page}/${maxPages}, candidates on page: ${(result.pageOrders || []).length}`);
+    const pageNumbers = (orders || []).map((order) => order.order_number).filter(Boolean);
+    log(`Shipped page ${page}: ${pageNumbers.length} order(s)`);
 
-    await collectFromPageResult(result, `page-${page}`);
+    let missing = [];
+    if (pageNumbers.length) {
+      try {
+        missing = await service.ordersMissingTracking(email, pageNumbers);
+      } catch (err) {
+        log(`em-data tracking lookup failed: ${err.message}`);
+        missing = pageNumbers;
+      }
+    }
+    log(`Missing tracking on page ${page}: ${missing.length} (${missing.join(', ') || 'none'})`);
 
-    if (!byNumber.size) break;
-    if (page >= maxPages) {
-      log(`Reached lookback page limit ${maxPages}, stop paging`);
-      break;
+    if (missing.length && !state.limitExceeded) {
+      const result = await sendToTab(tabId, {
+        action: 'scrapeTrackings',
+        orderNumbers: missing,
+      });
+      const batch = [];
+      const found = new Set();
+      for (const tracking of result.trackings || []) {
+        if (!missing.includes(tracking.order_number) || !tracking.tracking) continue;
+        batch.push(tracking);
+        found.add(tracking.order_number);
+      }
+      await reportTrackingBatch(batch, `shipped-page-${page}`);
+
+      const needDetail = missing.filter((number) => !found.has(number));
+      for (const orderNumber of needDetail) {
+        ensureNotStopped();
+        if (state.limitExceeded) {
+          log('Order detail daily limit exceeded, stop opening order details');
+          break;
+        }
+        setPhase('Open order detail', orderNumber);
+        log(`Open order detail for missing tracking: ${orderNumber}`);
+        const detail = await getOrderDetail(orderNumber);
+        if (detail?.tracking) {
+          await reportTrackingBatch([detail], `order-detail-${orderNumber}`);
+        }
+        await sleep(1000);
+      }
     }
 
+    if (page >= maxPages) break;
     const next = await sendToTab(tabId, { action: 'goNextPage' });
     if (!next?.hasNext) {
-      log('No next page, stop paging');
+      log('No next shipped page');
       break;
     }
     await sleep(2000);
@@ -614,60 +606,65 @@ async function collectOrderTrackings(service, email, lookbackPages) {
     page += 1;
   }
 
-  const remainingAfterPages = Array.from(byNumber.keys());
-  if (remainingAfterPages.length) {
-    log(
-      `Not found in ${maxPages} lookback page(s): ${remainingAfterPages.length} order(s). Opening order details: ${remainingAfterPages.join(', ')}`
-    );
+  log('========== Shipped tracking summary ==========');
+  log(`Collected: ${collected.length}`);
+  log(`Report succeeded: ${reportSuccess.length}`);
+  log(`Report failed: ${reportFailed.length}`);
+  log('================================================');
+}
+
+async function collectPendingFromDetails(service, email) {
+  setPhase('Loading pending requests');
+  let pending = [];
+  try {
+    pending = await service.getPendingCollectionOrders(email);
+  } catch (err) {
+    log(`Failed to load pending requests: ${err.message}`);
+    return;
   }
 
-  for (const orderNumber of remainingAfterPages) {
-    if (!byNumber.has(orderNumber)) continue;
+  const byNumber = new Map();
+  for (const req of pending || []) {
+    const orderNumber = req.order_number || req.buy_order_number;
+    if (!orderNumber) continue;
+    if (!byNumber.has(orderNumber)) byNumber.set(orderNumber, new Set());
+    byNumber.get(orderNumber).add(req.request_type || 'order_status');
+  }
+
+  if (!byNumber.size) {
+    log('No pending collection requests');
+    return { empty: true };
+  }
+
+  log(`Pending requests: ${pending.length} (${byNumber.size} unique order(s))`);
+  log(`Pending order numbers: ${Array.from(byNumber.keys()).join(', ')}`);
+
+  for (const [orderNumber, types] of byNumber.entries()) {
     ensureNotStopped();
     if (state.limitExceeded) {
-      log('Order detail daily limit exceeded, stop opening order details');
+      log('Order detail daily limit exceeded, stop pending details');
       break;
     }
 
-    setPhase('Open order detail', orderNumber);
-    log(`Open order detail: ${orderNumber}`);
-    const detailTracking = await getTrackingFromOrderPage(orderNumber);
-    if (detailTracking) {
-      await reportTrackingBatch([detailTracking], `order-detail-${orderNumber}`);
+    setPhase('Pending order detail', orderNumber);
+    log(`Open pending detail ${orderNumber} types=${Array.from(types).join(',')}`);
+    const detail = await getOrderDetail(orderNumber);
+    if (!detail) {
+      await sleep(1000);
+      continue;
+    }
+
+    const payload = { ...detail, buyer_email: email };
+    try {
+      const resp = await service.saveOrders([payload]);
+      log(`Pending detail report succeeded: ${orderNumber} ${JSON.stringify(resp)}`);
+    } catch (err) {
+      log(`Pending detail report failed: ${orderNumber}: ${err.message}`);
     }
     await sleep(1000);
   }
 
-  const notCollected = Array.from(byNumber.keys());
-  const collectedCount = collected.length;
-  const notCollectedCount = notCollected.length;
-
-  log('========== Tracking collection summary ==========');
-  log(`Pending: ${pendingTotal}`);
-  log(`Lookback pages: ${maxPages}`);
-  log(`Collected: ${collectedCount}`);
-  log(`Not collected: ${notCollectedCount}`);
-  if (collected.length) {
-    log('Collected details:');
-    for (const item of collected) {
-      log(
-        `  - ${item.order_number} => ${item.tracking}` +
-          (item.carrier ? ` (${item.carrier})` : '')
-      );
-    }
-  }
-  if (notCollected.length) {
-    log(`Not collected order numbers: ${notCollected.join(', ')}`);
-  }
-  log(`Report succeeded: ${reportSuccess.length}`);
-  if (reportSuccess.length) {
-    log(`Report succeeded orders: ${reportSuccess.join(', ')}`);
-  }
-  log(`Report failed: ${reportFailed.length}`);
-  if (reportFailed.length) {
-    log(`Report failed orders: ${reportFailed.join(', ')}`);
-  }
-  log('================================================');
+  return { empty: false };
 }
 
 async function runCollector({ email, days, mode = 'full' } = {}) {
@@ -677,7 +674,7 @@ async function runCollector({ email, days, mode = 'full' } = {}) {
 
   const settings = await chrome.storage.sync.get({ email: '', days: 3 });
   const localSettings = await chrome.storage.local.get({ token: '' });
-  const buyerEmail = (email || settings.email || '').trim();
+  const buyerEmail = normalizeAccount(email || settings.email || '');
   const apiToken = (localSettings.token || '').trim();
   const lookbackPages = Number(days || settings.days) || 3;
   const pendingOnly = mode === 'pending';
@@ -702,27 +699,20 @@ async function runCollector({ email, days, mode = 'full' } = {}) {
 
   try {
     const service = new EbayOrderService(apiToken);
+    log(`Collector started for ${buyerEmail}, mode=${pendingOnly ? 'request' : 'full'}, lookbackPages=${lookbackPages}`);
+    await collectLookbackOrderStatuses(service, buyerEmail, lookbackPages);
 
     if (pendingOnly) {
-      setPhase('Loading pending orders');
-      const pending = await service.getOrders(buyerEmail);
-      const pendingCount = Array.isArray(pending) ? pending.length : 0;
-      log(`Pending tracking / collection orders: ${pendingCount}`);
-      if (!pendingCount) {
+      const pendingResult = await collectPendingFromDetails(service, buyerEmail);
+      if (pendingResult?.empty) {
         setPhase('Done', 'no pending');
-        log('No pending orders; skip scrape');
+        log('No pending requests after lookback status collection');
+        await service.sendClickLog(buyerEmail);
         await finishRunLog('completed', { ok: true, pendingOnly: true, empty: true });
         return { ok: true, email: buyerEmail, empty: true };
       }
-      log(`Collector started for ${buyerEmail}, mode=pending`);
-      await collectOrderTrackings(service, buyerEmail, lookbackPages);
     } else {
-      log(`Collector started for ${buyerEmail}, lookbackPages=${lookbackPages}`);
-      // Order list still uses lookback as days cutoff for purchase history
-      await collectOrders(service, buyerEmail, lookbackPages, ORDER_URLS.all);
-      await collectOrders(service, buyerEmail, lookbackPages, ORDER_URLS.payment_failed, 3);
-      await collectOrders(service, buyerEmail, lookbackPages, ORDER_URLS.returns_and_canceled, 3);
-      await collectOrderTrackings(service, buyerEmail, lookbackPages);
+      await collectTrackingsFromShippedLookback(service, buyerEmail, lookbackPages);
     }
 
     await service.sendClickLog(buyerEmail);

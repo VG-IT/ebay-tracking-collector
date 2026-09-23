@@ -54,7 +54,7 @@
       Pending poll interval (hours)
       <input type="number" id="pending-poll-hours" min="1" max="24" value="2" />
     </label>
-    <p class="hint checkbox-hint">Reads pending orders from EveryMarket, collects tracking, then uploads. Skips when queue is empty.</p>
+    <p class="hint checkbox-hint">Request mode: first collect lookback order-list status, then open a new detail page per pending status/tracking request and close it after scrape.</p>
 
     <div class="actions">
       <button type="button" id="save-btn" class="secondary">Save</button>
@@ -62,7 +62,7 @@
       <button type="button" id="pending-btn" class="secondary" disabled>Collect Pending</button>
       <button type="button" id="stop-btn" class="danger" disabled>Stop</button>
     </div>
-    <p class="hint">Start = full lookback + pending tracking. Collect Pending = only ops-requested / no-tracking orders, then upload.</p>
+    <p class="hint">Start = full mode (lookback list status, then shipped-list missing tracking). Collect Pending = request mode (lookback list status, then pending details).</p>
   </form>
 
   <section class="status-panel">
