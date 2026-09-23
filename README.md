@@ -21,19 +21,21 @@ Browser extension port of `web_crawler/bin/ebay/tracking_collector.py`. Scrapes 
 ### Full mode (Start / 00:00 / 12:00)
 
 1. Collect lookback purchase-list status (status, purchase date, order number, amount) and upload
-2. Walk lookback **Shipped** pages, ask em-data which of those order numbers lack tracking, collect tracking only for those, upload
+2. If em-data has **no pending collection requests** for this account, **stop**
+3. Walk lookback **Shipped** pages, ask em-data which of those order numbers lack tracking, collect tracking only for those, upload
 
 ### Request mode (Collect Pending / pending poll)
 
 1. Always run lookback purchase-list status collection first
 2. Load pending `order_status` / `tracking` requests from em-data
-3. Open a **new** order-detail tab per order, scrape, upload, then **close** that tab
+3. If none, **stop**
+4. Open a **new** order-detail tab per order, scrape, upload, then **close** that tab
 
 ### Scheduled collection
 
 After saving a valid login and settings:
 
-- **Auto-run full collect daily at 00:00 and 12:00** — full scrape + upload
+- **Auto-run full collect daily at 00:00 and 12:00** — lookback list status, then stop if no collection requests
 - **Auto-poll pending collection requests** — every N hours (default 2), reads pending from EveryMarket, collects only those, uploads; skips when empty
 
 Schedules use the computer's local time. Chrome must be running; if the eBay session expires, check login again.
@@ -43,6 +45,7 @@ Schedules use the computer's local time. Chrome must be running; if the eBay ses
 - Buyer email is stored in `chrome.storage.sync`
 - Everymarket token is stored in `chrome.storage.local` and shown as a password field
 - Tracking scans only lookback **Shipped** pages that em-data says are missing tracking; remaining missing numbers open a fresh order-detail tab, closed when that order is done
+- Lookback is a **page count** (default 3, max 50). Purchase-list paging stops at that limit, or sooner if the next page does not advance
 - Buyer email is stored lowercase in `chrome.storage.sync`
 - Successful syncs report to EveryMarket logging; completed runs also post a plugin click log
 

@@ -102,11 +102,23 @@
     if (!nextBtn || nextBtn.disabled || nextBtn.getAttribute('aria-disabled') === 'true') {
       return { hasNext: false };
     }
-    const before = location.href;
+    const beforeUrl = location.href;
+    const beforeOrders = pageOrderNumbers().join(',');
     nextBtn.click();
     await sleep(3000);
     await waitForBody();
-    return { hasNext: true, urlChanged: location.href !== before, url: location.href };
+
+    const afterBtn = document.querySelector('button.pagination__next');
+    const disabledAfter =
+      !afterBtn || afterBtn.disabled || afterBtn.getAttribute('aria-disabled') === 'true';
+    const afterOrders = pageOrderNumbers().join(',');
+    if (location.href === beforeUrl && afterOrders === beforeOrders) {
+      return { hasNext: false, stuck: true, url: location.href };
+    }
+    if (disabledAfter && afterOrders === beforeOrders) {
+      return { hasNext: false, stuck: true, url: location.href };
+    }
+    return { hasNext: true, urlChanged: location.href !== beforeUrl, url: location.href };
   }
 
   function waitForBody(timeout = 12000) {

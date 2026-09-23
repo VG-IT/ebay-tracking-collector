@@ -287,6 +287,7 @@ startBtn.addEventListener('click', async () => {
     payload: { email, days },
   });
   if (response?.error) appendLog(`Error: ${response.error}`);
+  else if (response?.empty) appendLog('Lookback list status collected; no collection requests, stopped');
   await loadRunLogs();
 });
 
@@ -309,7 +310,7 @@ pendingBtn.addEventListener('click', async () => {
     payload: { email, days },
   });
   if (response?.error) appendLog(`Error: ${response.error}`);
-  else if (response?.empty) appendLog('Lookback list status collected; no pending detail requests');
+  else if (response?.empty) appendLog('Lookback list status collected; no collection requests, stopped');
   await loadRunLogs();
 });
 

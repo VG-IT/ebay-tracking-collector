@@ -10,6 +10,7 @@ const state = {
   detailTabId: null,
   openedTabIds: [],
   limitExceeded: false,
+  heartbeatId: null,
   session: {
     checked: false,
     loggedIn: false,
@@ -19,6 +20,7 @@ const state = {
 };
 
 const MAX_RUN_LOGS = 3;
+const MAX_LOOKBACK_PAGES = 50;
 const AUTO_RUN_ALARM_PREFIX = 'ebay-tracking-auto-run-';
 const AUTO_RUN_HOURS = [0, 12];
 const PENDING_POLL_ALARM = 'ebay-tracking-pending-poll';
@@ -362,9 +364,13 @@ async function checkEbaySession({ openLogin = false } = {}) {
 
 function waitForTabComplete(tabId, timeout = 60000) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    let seenLoading = false;
     const started = Date.now();
 
     const finish = (ok, err) => {
+      if (settled) return;
+      settled = true;
       chrome.tabs.onUpdated.removeListener(listener);
       clearInterval(poll);
       if (ok) resolve();
@@ -372,15 +378,25 @@ function waitForTabComplete(tabId, timeout = 60000) {
     };
 
     const listener = (id, info) => {
-      if (id === tabId && info.status === 'complete') finish(true);
+      if (id !== tabId) return;
+      if (info.status === 'loading') seenLoading = true;
+      if (info.status === 'complete' && seenLoading) finish(true);
     };
     chrome.tabs.onUpdated.addListener(listener);
 
     const poll = setInterval(async () => {
+      if (state.stopRequested) {
+        finish(false, new Error('Stopped by user'));
+        return;
+      }
       try {
         const tab = await chrome.tabs.get(tabId);
-        if (tab.status === 'complete') finish(true);
-        else if (Date.now() - started > timeout) finish(false);
+        if (tab.status === 'loading') seenLoading = true;
+        if (tab.status === 'complete' && (seenLoading || Date.now() - started > 1500)) {
+          finish(true);
+        } else if (Date.now() - started > timeout) {
+          finish(false);
+        }
       } catch (err) {
         finish(false, err);
       }
@@ -388,16 +404,36 @@ function waitForTabComplete(tabId, timeout = 60000) {
   });
 }
 
-async function collectOrders(service, email, days, ordersUrl, maxPages = null) {
-  const earliest = Date.now() - days * 24 * 60 * 60 * 1000;
+function normalizeLookbackPages(value) {
+  const pages = Math.max(1, Number(value) || 3);
+  return Math.min(MAX_LOOKBACK_PAGES, pages);
+}
+
+function startRunHeartbeat() {
+  stopRunHeartbeat();
+  state.heartbeatId = setInterval(() => {
+    void chrome.storage.local.set({ collectorHeartbeatAt: Date.now() });
+  }, 15000);
+}
+
+function stopRunHeartbeat() {
+  if (state.heartbeatId) {
+    clearInterval(state.heartbeatId);
+    state.heartbeatId = null;
+  }
+}
+
+async function collectOrders(service, email, ordersUrl, maxPages) {
+  const pageLimit = normalizeLookbackPages(maxPages);
   const tabId = await openOrReuseTab(ordersUrl);
   await sleep(2000);
   await ensureStillLoggedIn(tabId);
 
   let page = 1;
-  while (true) {
+  let prevKey = '';
+  while (page <= pageLimit) {
     ensureNotStopped();
-    setPhase('Collecting orders', `page ${page}`);
+    setPhase('Collecting orders', `page ${page}/${pageLimit}`);
     await ensureStillLoggedIn(tabId);
 
     const { orders } = await sendToTab(tabId, {
@@ -412,10 +448,17 @@ async function collectOrders(service, email, days, ordersUrl, maxPages = null) {
       break;
     }
 
+    const pageKey = orders.map((order) => order.order_number).filter(Boolean).join(',');
+    if (pageKey && pageKey === prevKey) {
+      log(`Page ${page} repeated the previous order list, stop paging`);
+      break;
+    }
+    prevKey = pageKey;
+
     orders.forEach((order) => {
       order.buyer_email = email;
     });
-    log(`Found ${orders.length} orders on page ${page}`);
+    log(`Found ${orders.length} orders on page ${page}/${pageLimit}`);
     try {
       const resp = await service.saveOrders(orders);
       debug('saveOrders response', resp);
@@ -426,21 +469,16 @@ async function collectOrders(service, email, days, ordersUrl, maxPages = null) {
       log(`Orders report failed: ${err.message}`);
     }
 
-    if (maxPages && page >= maxPages) break;
-
-    if (!maxPages) {
-      const reached = orders.some((order) => {
-        if (!order.purchase_date) return false;
-        return new Date(order.purchase_date).getTime() < earliest;
-      });
-      if (reached) {
-        log('Reached earliest order date');
-        break;
-      }
+    if (page >= pageLimit) {
+      log(`Reached lookback page limit (${pageLimit})`);
+      break;
     }
 
     const next = await sendToTab(tabId, { action: 'goNextPage' });
-    if (!next?.hasNext) break;
+    if (!next?.hasNext) {
+      log(next?.stuck ? 'Pagination did not advance, stop paging' : 'No next order-list page');
+      break;
+    }
     await sleep(2000);
     await ensureStillLoggedIn(tabId);
     page += 1;
@@ -499,14 +537,15 @@ async function getOrderDetail(orderNumber) {
 }
 
 async function collectLookbackOrderStatuses(service, email, lookbackPages) {
-  log(`Collecting lookback order-list status for ${email}`);
-  await collectOrders(service, email, lookbackPages, ORDER_URLS.all);
-  await collectOrders(service, email, lookbackPages, ORDER_URLS.payment_failed, 3);
-  await collectOrders(service, email, lookbackPages, ORDER_URLS.returns_and_canceled, 3);
+  const maxPages = normalizeLookbackPages(lookbackPages);
+  log(`Collecting lookback order-list status for ${email}, up to ${maxPages} page(s)`);
+  await collectOrders(service, email, ORDER_URLS.all, maxPages);
+  await collectOrders(service, email, ORDER_URLS.payment_failed, Math.min(maxPages, 3));
+  await collectOrders(service, email, ORDER_URLS.returns_and_canceled, Math.min(maxPages, 3));
 }
 
 async function collectTrackingsFromShippedLookback(service, email, lookbackPages) {
-  const maxPages = Math.max(1, Number(lookbackPages) || 3);
+  const maxPages = normalizeLookbackPages(lookbackPages);
   setPhase('Collecting shipped-list tracking', `up to ${maxPages} page(s)`);
   log(`Shipped lookback tracking: scan ${maxPages} page(s), query em-data, collect missing tracking`);
 
@@ -541,6 +580,7 @@ async function collectTrackingsFromShippedLookback(service, email, lookbackPages
   }
 
   let page = 1;
+  let prevKey = '';
   while (page <= maxPages) {
     ensureNotStopped();
     setPhase('Collecting shipped-list tracking', `page ${page}/${maxPages}`);
@@ -552,6 +592,13 @@ async function collectTrackingsFromShippedLookback(service, email, lookbackPages
     });
     const pageNumbers = (orders || []).map((order) => order.order_number).filter(Boolean);
     log(`Shipped page ${page}: ${pageNumbers.length} order(s)`);
+
+    const pageKey = pageNumbers.join(',');
+    if (pageKey && pageKey === prevKey) {
+      log(`Shipped page ${page} repeated the previous order list, stop paging`);
+      break;
+    }
+    prevKey = pageKey;
 
     let missing = [];
     if (pageNumbers.length) {
@@ -598,7 +645,7 @@ async function collectTrackingsFromShippedLookback(service, email, lookbackPages
     if (page >= maxPages) break;
     const next = await sendToTab(tabId, { action: 'goNextPage' });
     if (!next?.hasNext) {
-      log('No next shipped page');
+      log(next?.stuck ? 'Shipped pagination did not advance, stop paging' : 'No next shipped page');
       break;
     }
     await sleep(2000);
@@ -613,16 +660,7 @@ async function collectTrackingsFromShippedLookback(service, email, lookbackPages
   log('================================================');
 }
 
-async function collectPendingFromDetails(service, email) {
-  setPhase('Loading pending requests');
-  let pending = [];
-  try {
-    pending = await service.getPendingCollectionOrders(email);
-  } catch (err) {
-    log(`Failed to load pending requests: ${err.message}`);
-    return;
-  }
-
+function groupPendingByOrderNumber(pending) {
   const byNumber = new Map();
   for (const req of pending || []) {
     const orderNumber = req.order_number || req.buy_order_number;
@@ -630,24 +668,35 @@ async function collectPendingFromDetails(service, email) {
     if (!byNumber.has(orderNumber)) byNumber.set(orderNumber, new Set());
     byNumber.get(orderNumber).add(req.request_type || 'order_status');
   }
+  return byNumber;
+}
 
-  if (!byNumber.size) {
-    log('No pending collection requests');
-    return { empty: true };
+async function loadPendingCollectionRequests(service, email) {
+  setPhase('Loading collection requests');
+  try {
+    const pending = await service.getPendingCollectionOrders(email);
+    return Array.isArray(pending) ? pending : [];
+  } catch (err) {
+    log(`Failed to load collection requests: ${err.message}`);
+    return [];
   }
+}
 
-  log(`Pending requests: ${pending.length} (${byNumber.size} unique order(s))`);
+async function collectPendingFromDetails(service, email, byNumber) {
+  log(`Pending requests: ${byNumber.size} unique order(s)`);
   log(`Pending order numbers: ${Array.from(byNumber.keys()).join(', ')}`);
 
+  let index = 0;
   for (const [orderNumber, types] of byNumber.entries()) {
+    index += 1;
     ensureNotStopped();
     if (state.limitExceeded) {
       log('Order detail daily limit exceeded, stop pending details');
       break;
     }
 
-    setPhase('Pending order detail', orderNumber);
-    log(`Open pending detail ${orderNumber} types=${Array.from(types).join(',')}`);
+    setPhase('Pending order detail', `${index}/${byNumber.size} ${orderNumber}`);
+    log(`Open pending detail ${index}/${byNumber.size} ${orderNumber} types=${Array.from(types).join(',')}`);
     const detail = await getOrderDetail(orderNumber);
     if (!detail) {
       await sleep(1000);
@@ -663,8 +712,6 @@ async function collectPendingFromDetails(service, email) {
     }
     await sleep(1000);
   }
-
-  return { empty: false };
 }
 
 async function runCollector({ email, days, mode = 'full' } = {}) {
@@ -676,7 +723,7 @@ async function runCollector({ email, days, mode = 'full' } = {}) {
   const localSettings = await chrome.storage.local.get({ token: '' });
   const buyerEmail = normalizeAccount(email || settings.email || '');
   const apiToken = (localSettings.token || '').trim();
-  const lookbackPages = Number(days || settings.days) || 3;
+  const lookbackPages = normalizeLookbackPages(days || settings.days);
   const pendingOnly = mode === 'pending';
 
   if (!buyerEmail) {
@@ -696,21 +743,27 @@ async function runCollector({ email, days, mode = 'full' } = {}) {
   state.detailTabId = null;
   setPhase('Starting');
   startRunLog({ email: buyerEmail, days: lookbackPages });
+  startRunHeartbeat();
 
   try {
     const service = new EbayOrderService(apiToken);
     log(`Collector started for ${buyerEmail}, mode=${pendingOnly ? 'request' : 'full'}, lookbackPages=${lookbackPages}`);
     await collectLookbackOrderStatuses(service, buyerEmail, lookbackPages);
 
+    const pending = await loadPendingCollectionRequests(service, buyerEmail);
+    const byNumber = groupPendingByOrderNumber(pending);
+    if (!byNumber.size) {
+      setPhase('Done', 'no collection requests');
+      log('Lookback list status collected; no collection requests, stop');
+      await service.sendClickLog(buyerEmail);
+      await finishRunLog('completed', { ok: true, pendingOnly, empty: true });
+      return { ok: true, email: buyerEmail, empty: true };
+    }
+
+    log(`Collection requests after lookback: ${pending.length} (${byNumber.size} unique order(s))`);
+
     if (pendingOnly) {
-      const pendingResult = await collectPendingFromDetails(service, buyerEmail);
-      if (pendingResult?.empty) {
-        setPhase('Done', 'no pending');
-        log('No pending requests after lookback status collection');
-        await service.sendClickLog(buyerEmail);
-        await finishRunLog('completed', { ok: true, pendingOnly: true, empty: true });
-        return { ok: true, email: buyerEmail, empty: true };
-      }
+      await collectPendingFromDetails(service, buyerEmail, byNumber);
     } else {
       await collectTrackingsFromShippedLookback(service, buyerEmail, lookbackPages);
     }
@@ -739,6 +792,7 @@ async function runCollector({ email, days, mode = 'full' } = {}) {
     await finishRunLog('error', { error: err.message });
     return { error: err.message };
   } finally {
+    stopRunHeartbeat();
     if (state.currentRun) {
       await finishRunLog('interrupted');
     }
